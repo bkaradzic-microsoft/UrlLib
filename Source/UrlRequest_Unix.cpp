@@ -53,6 +53,7 @@ namespace
             case CURLE_BAD_CONTENT_ENCODING: return "CURLE_BAD_CONTENT_ENCODING";
             case CURLE_SSL_CACERT_BADFILE: return "CURLE_SSL_CACERT_BADFILE";
             case CURLE_REMOTE_FILE_NOT_FOUND: return "CURLE_REMOTE_FILE_NOT_FOUND";
+            case CURLE_ABORTED_BY_CALLBACK: return "CURLE_ABORTED_BY_CALLBACK";
             default: return "CURLE_" + std::to_string(static_cast<int>(code));
         }
     }
@@ -148,6 +149,19 @@ namespace UrlLib
                 // Request-specific failure detail (host/port/path specifics) lands here during
                 // curl_easy_perform; see the error handling in PerformAsync.
                 curl_check(curl_easy_setopt(m_curl, CURLOPT_ERRORBUFFER, m_curlErrorBuffer.data()));
+
+                // Observe Abort(): curl_easy_perform runs synchronously on a worker thread and does
+                // not watch m_cancellationSource on its own. The progress callback is invoked
+                // periodically during the transfer (including while connecting); returning non-zero
+                // makes curl_easy_perform return CURLE_ABORTED_BY_CALLBACK, which PerformAsync records
+                // as the transport error. cancellation_source::cancelled() is safe to poll from the
+                // worker thread while Abort() is called from another.
+                curl_check(curl_easy_setopt(m_curl, CURLOPT_NOPROGRESS, 0L));
+                curl_check(curl_easy_setopt(m_curl, CURLOPT_XFERINFODATA, &m_cancellationSource));
+                curl_check(curl_easy_setopt(m_curl, CURLOPT_XFERINFOFUNCTION,
+                    +[](void* clientp, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {
+                        return static_cast<const arcana::cancellation_source*>(clientp)->cancelled() ? 1 : 0;
+                    }));
             }
         }
 
