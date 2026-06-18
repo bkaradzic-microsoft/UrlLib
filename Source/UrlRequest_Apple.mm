@@ -230,11 +230,16 @@ namespace UrlLib
 
             // Observe Abort(): NSURLSession runs the request asynchronously and does not watch
             // m_cancellationSource on its own. Cancelling the task makes its completion handler fire
-            // with NSURLErrorCancelled (recorded as the transport error). The listener fires
-            // synchronously if the request was already aborted. The ticket is reset on each send and
-            // released before m_cancellationSource (a base member) is destroyed.
-            m_cancellationTicket = m_cancellationSource.add_listener([task]() {
-                [task cancel];
+            // with NSURLErrorCancelled (recorded as the transport error). The task is captured
+            // *weakly* so the listener does not keep a finished task alive -- NSURLSession releases
+            // the task once its completion handler has run, after which a late Abort() loads a nil
+            // strong reference and the -cancel is a safe no-op. The listener fires synchronously if
+            // the request was already aborted; the ticket is reset on each send and released before
+            // m_cancellationSource (a base member) is destroyed.
+            __weak NSURLSessionDataTask* weakTask = task;
+            m_cancellationTicket = m_cancellationSource.add_listener([weakTask]() {
+                NSURLSessionDataTask* strongTask = weakTask;
+                [strongTask cancel];
             });
 
             return taskCompletionSource.as_task();
