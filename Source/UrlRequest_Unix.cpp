@@ -156,6 +156,13 @@ namespace UrlLib
                 // makes curl_easy_perform return CURLE_ABORTED_BY_CALLBACK, which PerformAsync records
                 // as the transport error. cancellation_source::cancelled() is safe to poll from the
                 // worker thread while Abort() is called from another.
+                //
+                // NOTE: this relies on the libcurl *easy* interface, which ticks the progress
+                // callback even during idle periods (~once per second when no bytes are flowing), so
+                // Abort() interrupts a hanging/idle peer promptly. The *multi* interface does NOT call
+                // the progress function during idle waits, so a future migration to curl_multi_* would
+                // silently break abort against an idle peer unless cancellation is also wired into the
+                // poll loop (e.g. a short curl_multi_poll timeout that re-checks cancelled()).
                 curl_check(curl_easy_setopt(m_curl, CURLOPT_NOPROGRESS, 0L));
                 curl_check(curl_easy_setopt(m_curl, CURLOPT_XFERINFODATA, &m_cancellationSource));
                 curl_check(curl_easy_setopt(m_curl, CURLOPT_XFERINFOFUNCTION,
