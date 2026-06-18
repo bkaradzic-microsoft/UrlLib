@@ -235,12 +235,15 @@ namespace UrlLib
             // the task once its completion handler has run, after which a late Abort() loads a nil
             // strong reference and the -cancel is a safe no-op. The listener fires synchronously if
             // the request was already aborted; the ticket is reset on each send and released before
-            // m_cancellationSource (a base member) is destroyed.
+            // m_cancellationSource (a base member) is destroyed. emplace() (not assignment) is used
+            // because arcana::cancellation::ticket is a move-only final_action whose assignment
+            // operators are deleted, so std::optional::operator= would not compile; emplace destroys
+            // any prior ticket (releasing the previous send's listener) and move-constructs the new one.
             __weak NSURLSessionDataTask* weakTask = task;
-            m_cancellationTicket = m_cancellationSource.add_listener([weakTask]() {
+            m_cancellationTicket.emplace(m_cancellationSource.add_listener([weakTask]() {
                 NSURLSessionDataTask* strongTask = weakTask;
                 [strongTask cancel];
-            });
+            }));
 
             return taskCompletionSource.as_task();
         }
