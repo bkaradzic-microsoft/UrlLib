@@ -1,14 +1,11 @@
 #include "UrlRequest_Base.h"
 
 #include <curl/curl.h>
-#include <sys/socket.h>
 #include <unistd.h>
 #include <array>
-#include <atomic>
 #include <cstring>
 #include <filesystem>
 #include <cassert>
-#include <optional>
 #include <sstream>
 
 namespace
@@ -150,33 +147,8 @@ namespace UrlLib
                 curl_check(curl_easy_setopt(m_curl, CURLOPT_HEADERFUNCTION, HeaderCallback));
                 curl_check(curl_easy_setopt(m_curl, CURLOPT_FOLLOWLOCATION, 1L));
                 // Request-specific failure detail (host/port/path specifics) lands here during
-                // curl_easy_perform; see the error handling in PerformAsync.
+                // the transfer; see the error handling in PerformAsync.
                 curl_check(curl_easy_setopt(m_curl, CURLOPT_ERRORBUFFER, m_curlErrorBuffer.data()));
-
-                // Observe Abort(): curl_easy_perform runs synchronously on a worker thread and does
-                // not watch m_cancellationSource on its own. Two cooperating mechanisms cancel it:
-                //
-                // 1. A progress callback that returns non-zero once cancelled, making
-                //    curl_easy_perform return CURLE_ABORTED_BY_CALLBACK. libcurl invokes it during
-                //    DNS/connect and whenever it services socket activity, so this alone aborts a
-                //    request that is actively transferring or still connecting.
-                // 2. Socket interruption: while waiting for a response from a connected-but-idle peer
-                //    (no bytes flowing), libcurl's internal poll can block without ticking the
-                //    progress callback, so the open-socket callback records the transfer socket and
-                //    the cancellation listener shutdown()s it. That wakes the poll; libcurl then
-                //    services the socket, runs the progress callback, and returns
-                //    CURLE_ABORTED_BY_CALLBACK. cancelled() and the socket handle are atomics, safe to
-                //    touch from the aborting thread while perform() runs on the worker.
-                curl_check(curl_easy_setopt(m_curl, CURLOPT_NOPROGRESS, 0L));
-                curl_check(curl_easy_setopt(m_curl, CURLOPT_XFERINFODATA, &m_cancellationSource));
-                curl_check(curl_easy_setopt(m_curl, CURLOPT_XFERINFOFUNCTION,
-                    +[](void* clientp, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {
-                        return static_cast<const arcana::cancellation_source*>(clientp)->cancelled() ? 1 : 0;
-                    }));
-                curl_check(curl_easy_setopt(m_curl, CURLOPT_OPENSOCKETDATA, this));
-                curl_check(curl_easy_setopt(m_curl, CURLOPT_OPENSOCKETFUNCTION, &OpenSocketCallback));
-                curl_check(curl_easy_setopt(m_curl, CURLOPT_CLOSESOCKETDATA, this));
-                curl_check(curl_easy_setopt(m_curl, CURLOPT_CLOSESOCKETFUNCTION, &CloseSocketCallback));
             }
         }
 
@@ -207,20 +179,9 @@ namespace UrlLib
         {
             if (m_thread.has_value())
             {
-                // Backstop so destruction never deadlocks on join(): if the worker is still blocked
-                // in curl_easy_perform against a hung peer and Abort() was not called explicitly,
-                // interrupt the transfer socket so perform() returns.
-                const curl_socket_t socket = m_socket.load();
-                if (socket != CURL_SOCKET_BAD)
-                {
-                    ::shutdown(socket, SHUT_RDWR);
-                }
                 m_thread->join();
                 m_thread = {};
             }
-
-            // The listener captures `this` and reads m_socket; drop it before those are gone.
-            m_cancellationTicket.reset();
 
             if (m_curlu)
             {
@@ -235,28 +196,6 @@ namespace UrlLib
             }
         }
 
-        // Records the transfer socket so Abort() can interrupt a blocking poll. libcurl invokes this
-        // on the worker thread to create the socket; the default behavior is replicated and the
-        // handle stored atomically.
-        static curl_socket_t OpenSocketCallback(void* clientp, curlsocktype /*purpose*/, struct curl_sockaddr* address)
-        {
-            auto* self = static_cast<Impl*>(clientp);
-            const curl_socket_t socket = ::socket(address->family, address->socktype, address->protocol);
-            self->m_socket.store(socket); // CURL_SOCKET_BAD on failure, which curl treats as an error
-            return socket;
-        }
-
-        // Clears the recorded handle when libcurl closes that socket, so a later Abort() cannot
-        // shutdown() a descriptor the OS has since reused for another connection.
-        static int CloseSocketCallback(void* clientp, curl_socket_t item)
-        {
-            auto* self = static_cast<Impl*>(clientp);
-            curl_socket_t expected = item;
-            self->m_socket.compare_exchange_strong(expected, CURL_SOCKET_BAD);
-            return ::close(item);
-        }
-
-
         static void Append(std::string& string, char* buffer, size_t nitems)
         {
             string.insert(string.end(), buffer, buffer + nitems);
@@ -266,6 +205,65 @@ namespace UrlLib
         {
             auto bytes = reinterpret_cast<std::byte*>(buffer);
             byteVector.insert(byteVector.end(), bytes, bytes + nitems);   
+        }
+
+        // Drives the transfer through the libcurl *multi* interface rather than curl_easy_perform so
+        // that Abort() is observed promptly. curl_easy_perform blocks in an internal poll that, when
+        // a peer accepts the connection but sends nothing, can wait indefinitely without invoking any
+        // callback -- so a cancelled request would hang until the peer or OS gave up. Polling with a
+        // bounded timeout lets the loop re-check m_cancellationSource between waits, bounding abort
+        // latency to ~kPollTimeoutMs regardless of peer activity. Runs on the worker thread.
+        CURLcode PerformWithCancellation()
+        {
+            CURLM* multi = curl_multi_init();
+            if (multi == nullptr)
+            {
+                return CURLE_OUT_OF_MEMORY;
+            }
+            auto multiScope = gsl::finally([this, multi] {
+                curl_multi_remove_handle(multi, m_curl);
+                curl_multi_cleanup(multi);
+            });
+
+            if (curl_multi_add_handle(multi, m_curl) != CURLM_OK)
+            {
+                return CURLE_FAILED_INIT;
+            }
+
+            constexpr int kPollTimeoutMs = 100;
+            int runningHandles = 0;
+            do
+            {
+                if (m_cancellationSource.cancelled())
+                {
+                    return CURLE_ABORTED_BY_CALLBACK;
+                }
+
+                if (curl_multi_perform(multi, &runningHandles) != CURLM_OK)
+                {
+                    return CURLE_RECV_ERROR;
+                }
+
+                // Wait for socket activity but wake at least every kPollTimeoutMs so the cancellation
+                // check above runs even when the peer is idle (curl_multi_poll waits the full timeout
+                // even when there are no fds, so this never busy-loops during DNS resolution).
+                if (runningHandles != 0 && curl_multi_poll(multi, nullptr, 0, kPollTimeoutMs, nullptr) != CURLM_OK)
+                {
+                    return CURLE_RECV_ERROR;
+                }
+            } while (runningHandles != 0);
+
+            // The transfer finished; surface the per-easy-handle result code.
+            CURLcode result = CURLE_OK;
+            int messagesInQueue = 0;
+            while (CURLMsg* message = curl_multi_info_read(multi, &messagesInQueue))
+            {
+                if (message->msg == CURLMSG_DONE && message->easy_handle == m_curl)
+                {
+                    result = message->data.result;
+                }
+            }
+            return result;
         }
 
         template<typename DataT>
@@ -284,24 +282,10 @@ namespace UrlLib
 
             arcana::task_completion_source<void, std::exception_ptr> taskCompletionSource{};
 
-            // Wire Abort() to interrupt this request: if the worker is blocked waiting on an idle
-            // socket, shutdown() wakes it so the progress callback can return the abort. The socket
-            // is recorded by OpenSocketCallback during curl_easy_perform; emplace() resets any prior
-            // send's listener (and fires synchronously if the request was already aborted, where the
-            // socket is still CURL_SOCKET_BAD and the shutdown is skipped).
-            m_socket.store(CURL_SOCKET_BAD);
-            m_cancellationTicket.emplace(m_cancellationSource.add_listener([this]() {
-                const curl_socket_t socket = m_socket.load();
-                if (socket != CURL_SOCKET_BAD)
-                {
-                    ::shutdown(socket, SHUT_RDWR);
-                }
-            }));
-
             m_thread.emplace([this, taskCompletionSource]() mutable
             {
                 m_curlErrorBuffer[0] = '\0';
-                const CURLcode performResult = curl_easy_perform(m_curl);
+                const CURLcode performResult = PerformWithCancellation();
                 if (performResult != CURLE_OK)
                 {
                     // Retain the default status code of 0 to indicate a client side error,
@@ -433,11 +417,6 @@ namespace UrlLib
         CURLU* m_curlu{};
         bool m_file{};
         std::array<char, CURL_ERROR_SIZE> m_curlErrorBuffer{};
-        // The active transfer socket (recorded by OpenSocketCallback), so Abort() can shutdown() it
-        // to interrupt a blocking poll. Atomic: written on the worker thread, read on the aborting
-        // thread. Declared before m_cancellationTicket so it outlives the listener that reads it.
-        std::atomic<curl_socket_t> m_socket{CURL_SOCKET_BAD};
-        std::optional<arcana::cancellation::ticket> m_cancellationTicket{};
         std::optional<std::thread> m_thread{};
     };
 }
