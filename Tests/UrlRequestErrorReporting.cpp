@@ -52,6 +52,13 @@ namespace
         ::closesocket(socket);
     }
 
+    // Wakes a thread blocked in accept()/recv() on this socket. Closing the socket alone does not
+    // reliably interrupt a blocking call in another thread.
+    void ShutdownSocket(NativeSocket socket)
+    {
+        ::shutdown(socket, SD_BOTH);
+    }
+
     bool EnsureSocketsInitialized()
     {
         static const bool initialized = [] {
@@ -73,6 +80,13 @@ namespace
     void CloseSocket(NativeSocket socket)
     {
         ::close(socket);
+    }
+
+    // Wakes a thread blocked in accept()/recv() on this socket. On Linux, close() in another thread
+    // does NOT interrupt a blocking accept(); shutdown() does.
+    void ShutdownSocket(NativeSocket socket)
+    {
+        ::shutdown(socket, SHUT_RDWR);
     }
 
     bool EnsureSocketsInitialized()
@@ -246,7 +260,10 @@ namespace
         {
             if (m_listener != InvalidSocket)
             {
-                CloseSocket(m_listener); // unblocks the accept() loop
+                // shutdown() (not just close()) so a thread blocked in accept() is woken: on Linux
+                // close() in another thread does not interrupt the blocking accept().
+                ShutdownSocket(m_listener);
+                CloseSocket(m_listener);
             }
             if (m_acceptThread.joinable())
             {
